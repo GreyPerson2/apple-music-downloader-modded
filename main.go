@@ -46,6 +46,9 @@ var (
 	artist_select  bool
 	debug_mode     bool
 	print_json     bool
+	skip_mv        bool
+	skip_error     bool
+	lyrics_only    bool
 	alac_max       *int
 	atmos_max      *int
 	mv_max         *int
@@ -85,6 +88,101 @@ func LimitString(s string) string {
 		return string([]rune(s)[:Config.LimitMax])
 	}
 	return s
+}
+
+func maxPathPartLen() int {
+	if Config.PathPartMax > 0 {
+		return Config.PathPartMax
+	}
+	if Config.LimitMax > 0 {
+		return Config.LimitMax
+	}
+	return 200
+}
+
+func cleanupPathPart(s string) string {
+	s = strings.TrimSpace(s)
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	s = regexp.MustCompile(`\(\s*\)`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`\[\s*\]`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`\{\s*\}`).ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+	return s
+}
+
+func renderTemplate(tmpl string, vars map[string]string) string {
+	if tmpl == "" {
+		return ""
+	}
+	repl := make([]string, 0, len(vars)*2)
+	for k, v := range vars {
+		repl = append(repl, k, v)
+	}
+	return strings.NewReplacer(repl...).Replace(tmpl)
+}
+
+// renderTemplateWithTrim renders a template and ensures it fits within maxPathPartLen().
+// If it doesn't fit, it will blank out variables listed in Config.PathPartTrimVars (in order)
+// until it fits, then finally hard-truncates as a last resort.
+func renderTemplateWithTrim(tmpl string, vars map[string]string) string {
+	local := make(map[string]string, len(vars))
+	for k, v := range vars {
+		local[k] = v
+	}
+
+	maxLen := maxPathPartLen()
+	out := cleanupPathPart(renderTemplate(tmpl, local))
+	if len([]rune(out)) <= maxLen {
+		return out
+	}
+
+	for _, k := range Config.PathPartTrimVars {
+		if _, ok := local[k]; !ok {
+			continue
+		}
+		local[k] = ""
+		out = cleanupPathPart(renderTemplate(tmpl, local))
+		if len([]rune(out)) <= maxLen {
+			return out
+		}
+	}
+
+	r := []rune(out)
+	if len(r) > maxLen {
+		out = string(r[:maxLen])
+	}
+	return cleanupPathPart(out)
+}
+
+func embedMetaAllowlist() map[string]struct{} {
+	// If not configured, fall back to the old-mod-like defaults.
+	keys := Config.EmbedMetadata
+	if len(keys) == 0 {
+		keys = []string{
+			"title", "artist", "album", "album_artist", "composer", "album_created",
+			"genre", "created", "tracknum", "disk", "lyrics", "cover", "copyright",
+			"record_company", "upc", "isrc", "rtng", "song_id", "album_id", "artist_id",
+		}
+	}
+	m := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		k = strings.TrimSpace(strings.ToLower(k))
+		if k == "" {
+			continue
+		}
+		m[k] = struct{}{}
+	}
+	return m
+}
+
+func metaEnabled(allow map[string]struct{}, key string) bool {
+	_, ok := allow[strings.ToLower(key)]
+	return ok
 }
 
 func isInArray(arr []int, target int) bool {
@@ -807,6 +905,16 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 
 	//mv dl dev
 	if track.Type == "music-videos" {
+		if lyrics_only {
+			fmt.Println("Skipping MV download (lyrics-only mode)")
+			counter.Success++
+			return
+		}
+		if skip_mv {
+			fmt.Println("Skipping MV download (skip-mv enabled)")
+			counter.Success++
+			return
+		}
 		if len(mediaUserToken) <= 50 {
 			fmt.Println("meida-user-token is not set, skip MV dl")
 			counter.Success++
@@ -890,16 +998,16 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 	Tag_string := strings.Join(stringsToJoin, " ")
 
-	songName := strings.NewReplacer(
-		"{SongId}", track.ID,
-		"{SongNumer}", fmt.Sprintf("%02d", track.TaskNum),
-		"{SongName}", LimitString(track.Resp.Attributes.Name),
-		"{DiscNumber}", fmt.Sprintf("%0d", track.Resp.Attributes.DiscNumber),
-		"{TrackNumber}", fmt.Sprintf("%0d", track.Resp.Attributes.TrackNumber),
-		"{Quality}", Quality,
-		"{Tag}", Tag_string,
-		"{Codec}", track.Codec,
-	).Replace(Config.SongFileFormat)
+	songName := renderTemplateWithTrim(Config.SongFileFormat, map[string]string{
+		"{SongId}":      track.ID,
+		"{SongNumer}":   fmt.Sprintf("%02d", track.TaskNum),
+		"{SongName}":    LimitString(track.Resp.Attributes.Name),
+		"{DiscNumber}":  fmt.Sprintf("%0d", track.Resp.Attributes.DiscNumber),
+		"{TrackNumber}": fmt.Sprintf("%0d", track.Resp.Attributes.TrackNumber),
+		"{Quality}":     Quality,
+		"{Tag}":         Tag_string,
+		"{Codec}":       track.Codec,
+	})
 	fmt.Println(songName)
 	filename := fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_"))
 	track.SaveName = filename
@@ -918,12 +1026,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 	//get lrc
 	var lrc string = ""
-	if Config.EmbedLrc || Config.SaveLrcFile {
+	lyricsDownloaded := false
+	if Config.EmbedLrc || Config.SaveLrcFile || lyrics_only {
 		lrcStr, err := lyrics.Get(track.Storefront, track.ID, Config.LrcType, Config.Language, Config.LrcFormat, token, mediaUserToken)
 		if err != nil {
 			fmt.Println(err)
 		} else {
-			if Config.SaveLrcFile {
+			lyricsDownloaded = true
+			if Config.SaveLrcFile || lyrics_only {
 				err := writeLyrics(track.SaveDir, lrcFilename, lrcStr)
 				if err != nil {
 					fmt.Printf("Failed to write lyrics")
@@ -933,6 +1043,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 				lrc = lrcStr
 			}
 		}
+	}
+	if lyrics_only {
+		counter.Success++
+		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+		if !lyricsDownloaded {
+			fmt.Println("No lyrics found for this track")
+		}
+		return
 	}
 
 	// Existence check now considers converted output (if original was deleted)
@@ -1012,11 +1130,12 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		}
 	}
 	//这里利用MP4box将fmp4转化为mp4，并添加ilst box与cover，方便后面的mp4tag添加更多自定义标签
+	allowMeta := embedMetaAllowlist()
 	tags := []string{
 		"tool=",
 		"artist=AppleMusic",
 	}
-	if Config.EmbedCover {
+	if Config.EmbedCover && metaEnabled(allowMeta, "cover") {
 		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 			track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
 			if err != nil {
@@ -1086,11 +1205,11 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	station.Codec = Codec
 	var singerFoldername string
 	if Config.ArtistFolderFormat != "" {
-		singerFoldername = strings.NewReplacer(
-			"{ArtistName}", "Apple Music Station",
-			"{ArtistId}", "",
-			"{UrlArtistName}", "Apple Music Station",
-		).Replace(Config.ArtistFolderFormat)
+		singerFoldername = renderTemplateWithTrim(Config.ArtistFolderFormat, map[string]string{
+			"{ArtistName}":    "Apple Music Station",
+			"{ArtistId}":      "",
+			"{UrlArtistName}": "Apple Music Station",
+		})
 		if strings.HasSuffix(singerFoldername, ".") {
 			singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
 		}
@@ -1107,14 +1226,14 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	os.MkdirAll(singerFolder, os.ModePerm)
 	station.SaveDir = singerFolder
 
-	playlistFolder := strings.NewReplacer(
-		"{ArtistName}", "Apple Music Station",
-		"{PlaylistName}", LimitString(station.Name),
-		"{PlaylistId}", station.ID,
-		"{Quality}", "",
-		"{Codec}", Codec,
-		"{Tag}", "",
-	).Replace(Config.PlaylistFolderFormat)
+	playlistFolder := renderTemplateWithTrim(Config.PlaylistFolderFormat, map[string]string{
+		"{ArtistName}":   "Apple Music Station",
+		"{PlaylistName}": LimitString(station.Name),
+		"{PlaylistId}":   station.ID,
+		"{Quality}":      "",
+		"{Codec}":        Codec,
+		"{Tag}":          "",
+	})
 	if strings.HasSuffix(playlistFolder, ".") {
 		playlistFolder = strings.ReplaceAll(playlistFolder, ".", "")
 	}
@@ -1167,16 +1286,16 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			counter.Success++
 			return nil
 		}
-		songName := strings.NewReplacer(
-			"{SongId}", station.ID,
-			"{SongNumer}", "01",
-			"{SongName}", LimitString(station.Name),
-			"{DiscNumber}", "1",
-			"{TrackNumber}", "1",
-			"{Quality}", "256Kbps",
-			"{Tag}", "",
-			"{Codec}", "AAC",
-		).Replace(Config.SongFileFormat)
+		songName := renderTemplateWithTrim(Config.SongFileFormat, map[string]string{
+			"{SongId}":      station.ID,
+			"{SongNumer}":   "01",
+			"{SongName}":    LimitString(station.Name),
+			"{DiscNumber}":  "1",
+			"{TrackNumber}": "1",
+			"{Quality}":     "256Kbps",
+			"{Tag}":         "",
+			"{Codec}":       "AAC",
+		})
 		fmt.Println(songName)
 		trackPath := filepath.Join(playlistFolderPath, fmt.Sprintf("%s.m4a", forbiddenNames.ReplaceAllString(songName, "_")))
 		exists, _ := fileExists(trackPath)
@@ -1326,17 +1445,17 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	var singerFoldername string
 	if Config.ArtistFolderFormat != "" {
 		if len(meta.Data[0].Relationships.Artists.Data) > 0 {
-			singerFoldername = strings.NewReplacer(
-				"{UrlArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
-				"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
-				"{ArtistId}", meta.Data[0].Relationships.Artists.Data[0].ID,
-			).Replace(Config.ArtistFolderFormat)
+			singerFoldername = renderTemplateWithTrim(Config.ArtistFolderFormat, map[string]string{
+				"{UrlArtistName}": LimitString(meta.Data[0].Attributes.ArtistName),
+				"{ArtistName}":    LimitString(meta.Data[0].Attributes.ArtistName),
+				"{ArtistId}":      meta.Data[0].Relationships.Artists.Data[0].ID,
+			})
 		} else {
-			singerFoldername = strings.NewReplacer(
-				"{UrlArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
-				"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
-				"{ArtistId}", "",
-			).Replace(Config.ArtistFolderFormat)
+			singerFoldername = renderTemplateWithTrim(Config.ArtistFolderFormat, map[string]string{
+				"{UrlArtistName}": LimitString(meta.Data[0].Attributes.ArtistName),
+				"{ArtistName}":    LimitString(meta.Data[0].Attributes.ArtistName),
+				"{ArtistId}":      "",
+			})
 		}
 		if strings.HasSuffix(singerFoldername, ".") {
 			singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
@@ -1408,19 +1527,19 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	}
 	Tag_string := strings.Join(stringsToJoin, " ")
 	var albumFolderName string
-	albumFolderName = strings.NewReplacer(
-		"{ReleaseDate}", meta.Data[0].Attributes.ReleaseDate,
-		"{ReleaseYear}", meta.Data[0].Attributes.ReleaseDate[:4],
-		"{ArtistName}", LimitString(meta.Data[0].Attributes.ArtistName),
-		"{AlbumName}", LimitString(meta.Data[0].Attributes.Name),
-		"{UPC}", meta.Data[0].Attributes.Upc,
-		"{RecordLabel}", meta.Data[0].Attributes.RecordLabel,
-		"{Copyright}", meta.Data[0].Attributes.Copyright,
-		"{AlbumId}", albumId,
-		"{Quality}", Quality,
-		"{Codec}", Codec,
-		"{Tag}", Tag_string,
-	).Replace(Config.AlbumFolderFormat)
+	albumFolderName = renderTemplateWithTrim(Config.AlbumFolderFormat, map[string]string{
+		"{ReleaseDate}":  meta.Data[0].Attributes.ReleaseDate,
+		"{ReleaseYear}":  meta.Data[0].Attributes.ReleaseDate[:4],
+		"{ArtistName}":   LimitString(meta.Data[0].Attributes.ArtistName),
+		"{AlbumName}":    LimitString(meta.Data[0].Attributes.Name),
+		"{UPC}":          meta.Data[0].Attributes.Upc,
+		"{RecordLabel}":  meta.Data[0].Attributes.RecordLabel,
+		"{Copyright}":    meta.Data[0].Attributes.Copyright,
+		"{AlbumId}":      albumId,
+		"{Quality}":      Quality,
+		"{Codec}":        Codec,
+		"{Tag}":          Tag_string,
+	})
 
 	if strings.HasSuffix(albumFolderName, ".") {
 		albumFolderName = strings.ReplaceAll(albumFolderName, ".", "")
@@ -1598,11 +1717,11 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	playlist.Codec = Codec
 	var singerFoldername string
 	if Config.ArtistFolderFormat != "" {
-		singerFoldername = strings.NewReplacer(
-			"{ArtistName}", "Apple Music",
-			"{ArtistId}", "",
-			"{UrlArtistName}", "Apple Music",
-		).Replace(Config.ArtistFolderFormat)
+		singerFoldername = renderTemplateWithTrim(Config.ArtistFolderFormat, map[string]string{
+			"{ArtistName}":    "Apple Music",
+			"{ArtistId}":      "",
+			"{UrlArtistName}": "Apple Music",
+		})
 		if strings.HasSuffix(singerFoldername, ".") {
 			singerFoldername = strings.ReplaceAll(singerFoldername, ".", "")
 		}
@@ -1673,14 +1792,14 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 		}
 	}
 	Tag_string := strings.Join(stringsToJoin, " ")
-	playlistFolder := strings.NewReplacer(
-		"{ArtistName}", "Apple Music",
-		"{PlaylistName}", LimitString(meta.Data[0].Attributes.Name),
-		"{PlaylistId}", playlistId,
-		"{Quality}", Quality,
-		"{Codec}", Codec,
-		"{Tag}", Tag_string,
-	).Replace(Config.PlaylistFolderFormat)
+	playlistFolder := renderTemplateWithTrim(Config.PlaylistFolderFormat, map[string]string{
+		"{ArtistName}":   "Apple Music",
+		"{PlaylistName}": LimitString(meta.Data[0].Attributes.Name),
+		"{PlaylistId}":   playlistId,
+		"{Quality}":      Quality,
+		"{Codec}":        Codec,
+		"{Tag}":          Tag_string,
+	})
 	if strings.HasSuffix(playlistFolder, ".") {
 		playlistFolder = strings.ReplaceAll(playlistFolder, ".", "")
 	}
@@ -1779,80 +1898,144 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 }
 
 func writeMP4Tags(track *task.Track, lrc string) error {
+	allow := embedMetaAllowlist()
 	t := &mp4tag.MP4Tags{
-		Title:      track.Resp.Attributes.Name,
-		TitleSort:  track.Resp.Attributes.Name,
-		Artist:     track.Resp.Attributes.ArtistName,
-		ArtistSort: track.Resp.Attributes.ArtistName,
 		Custom: map[string]string{
-			"PERFORMER":   track.Resp.Attributes.ArtistName,
-			"RELEASETIME": track.Resp.Attributes.ReleaseDate,
-			"ISRC":        track.Resp.Attributes.Isrc,
 			"LABEL":       "",
 			"UPC":         "",
 		},
-		Composer:     track.Resp.Attributes.ComposerName,
-		ComposerSort: track.Resp.Attributes.ComposerName,
-		CustomGenre:  track.Resp.Attributes.GenreNames[0],
-		Lyrics:       lrc,
-		TrackNumber:  int16(track.Resp.Attributes.TrackNumber),
-		DiscNumber:   int16(track.Resp.Attributes.DiscNumber),
-		Album:        track.Resp.Attributes.AlbumName,
-		AlbumSort:    track.Resp.Attributes.AlbumName,
+	}
+
+	if metaEnabled(allow, "title") {
+		t.Title = track.Resp.Attributes.Name
+		t.TitleSort = track.Resp.Attributes.Name
+	}
+	if metaEnabled(allow, "artist") {
+		t.Artist = track.Resp.Attributes.ArtistName
+		t.ArtistSort = track.Resp.Attributes.ArtistName
+		t.Custom["PERFORMER"] = track.Resp.Attributes.ArtistName
+	}
+	if metaEnabled(allow, "album") {
+		t.Album = track.Resp.Attributes.AlbumName
+		t.AlbumSort = track.Resp.Attributes.AlbumName
+	}
+	if metaEnabled(allow, "composer") {
+		t.Composer = track.Resp.Attributes.ComposerName
+		t.ComposerSort = track.Resp.Attributes.ComposerName
+	}
+	if metaEnabled(allow, "genre") && len(track.Resp.Attributes.GenreNames) > 0 {
+		t.CustomGenre = track.Resp.Attributes.GenreNames[0]
+	}
+	if metaEnabled(allow, "lyrics") {
+		t.Lyrics = lrc
+	}
+	if metaEnabled(allow, "tracknum") {
+		t.TrackNumber = int16(track.Resp.Attributes.TrackNumber)
+	}
+	if metaEnabled(allow, "disk") {
+		t.DiscNumber = int16(track.Resp.Attributes.DiscNumber)
+	}
+	if metaEnabled(allow, "created") {
+		t.Custom["RELEASETIME"] = track.Resp.Attributes.ReleaseDate
+	}
+	if metaEnabled(allow, "isrc") {
+		t.Custom["ISRC"] = track.Resp.Attributes.Isrc
 	}
 
 	if track.PreType == "albums" {
-		albumID, err := strconv.ParseUint(track.PreID, 10, 32)
-		if err != nil {
-			return err
+		if metaEnabled(allow, "album_id") {
+			albumID, err := strconv.ParseUint(track.PreID, 10, 32)
+			if err != nil {
+				return err
+			}
+			t.ItunesAlbumID = int32(albumID)
 		}
-		t.ItunesAlbumID = int32(albumID)
 	}
 
 	if len(track.Resp.Relationships.Artists.Data) > 0 {
-		artistID, err := strconv.ParseUint(track.Resp.Relationships.Artists.Data[0].ID, 10, 32)
-		if err != nil {
-			return err
+		if metaEnabled(allow, "artist_id") {
+			artistID, err := strconv.ParseUint(track.Resp.Relationships.Artists.Data[0].ID, 10, 32)
+			if err != nil {
+				return err
+			}
+			t.ItunesArtistID = int32(artistID)
 		}
-		t.ItunesArtistID = int32(artistID)
 	}
 
 	if (track.PreType == "playlists" || track.PreType == "stations") && !Config.UseSongInfoForPlaylist {
-		t.DiscNumber = 1
-		t.DiscTotal = 1
-		t.TrackNumber = int16(track.TaskNum)
-		t.TrackTotal = int16(track.TaskTotal)
-		t.Album = track.PlaylistData.Attributes.Name
-		t.AlbumSort = track.PlaylistData.Attributes.Name
-		t.AlbumArtist = track.PlaylistData.Attributes.ArtistName
-		t.AlbumArtistSort = track.PlaylistData.Attributes.ArtistName
+		if metaEnabled(allow, "disk") {
+			t.DiscNumber = 1
+			t.DiscTotal = 1
+		}
+		if metaEnabled(allow, "tracknum") {
+			t.TrackNumber = int16(track.TaskNum)
+			t.TrackTotal = int16(track.TaskTotal)
+		}
+		if metaEnabled(allow, "album") {
+			t.Album = track.PlaylistData.Attributes.Name
+			t.AlbumSort = track.PlaylistData.Attributes.Name
+		}
+		if metaEnabled(allow, "album_artist") {
+			t.AlbumArtist = track.PlaylistData.Attributes.ArtistName
+			t.AlbumArtistSort = track.PlaylistData.Attributes.ArtistName
+		}
 	} else if (track.PreType == "playlists" || track.PreType == "stations") && Config.UseSongInfoForPlaylist {
-		t.DiscTotal = int16(track.DiscTotal)
-		t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
-		t.AlbumArtist = track.AlbumData.Attributes.ArtistName
-		t.AlbumArtistSort = track.AlbumData.Attributes.ArtistName
-		t.Custom["UPC"] = track.AlbumData.Attributes.Upc
-		t.Custom["LABEL"] = track.AlbumData.Attributes.RecordLabel
-		t.Date = track.AlbumData.Attributes.ReleaseDate
-		t.Copyright = track.AlbumData.Attributes.Copyright
-		t.Publisher = track.AlbumData.Attributes.RecordLabel
+		if metaEnabled(allow, "disk") {
+			t.DiscTotal = int16(track.DiscTotal)
+		}
+		if metaEnabled(allow, "tracknum") {
+			t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
+		}
+		if metaEnabled(allow, "album_artist") {
+			t.AlbumArtist = track.AlbumData.Attributes.ArtistName
+			t.AlbumArtistSort = track.AlbumData.Attributes.ArtistName
+		}
+		if metaEnabled(allow, "upc") {
+			t.Custom["UPC"] = track.AlbumData.Attributes.Upc
+		}
+		if metaEnabled(allow, "record_company") {
+			t.Custom["LABEL"] = track.AlbumData.Attributes.RecordLabel
+			t.Publisher = track.AlbumData.Attributes.RecordLabel
+		}
+		if metaEnabled(allow, "album_created") {
+			t.Date = track.AlbumData.Attributes.ReleaseDate
+		}
+		if metaEnabled(allow, "copyright") {
+			t.Copyright = track.AlbumData.Attributes.Copyright
+		}
 	} else {
-		t.DiscTotal = int16(track.DiscTotal)
-		t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
-		t.AlbumArtist = track.AlbumData.Attributes.ArtistName
-		t.AlbumArtistSort = track.AlbumData.Attributes.ArtistName
-		t.Custom["UPC"] = track.AlbumData.Attributes.Upc
-		t.Date = track.AlbumData.Attributes.ReleaseDate
-		t.Copyright = track.AlbumData.Attributes.Copyright
-		t.Publisher = track.AlbumData.Attributes.RecordLabel
+		if metaEnabled(allow, "disk") {
+			t.DiscTotal = int16(track.DiscTotal)
+		}
+		if metaEnabled(allow, "tracknum") {
+			t.TrackTotal = int16(track.AlbumData.Attributes.TrackCount)
+		}
+		if metaEnabled(allow, "album_artist") {
+			t.AlbumArtist = track.AlbumData.Attributes.ArtistName
+			t.AlbumArtistSort = track.AlbumData.Attributes.ArtistName
+		}
+		if metaEnabled(allow, "upc") {
+			t.Custom["UPC"] = track.AlbumData.Attributes.Upc
+		}
+		if metaEnabled(allow, "album_created") {
+			t.Date = track.AlbumData.Attributes.ReleaseDate
+		}
+		if metaEnabled(allow, "copyright") {
+			t.Copyright = track.AlbumData.Attributes.Copyright
+		}
+		if metaEnabled(allow, "record_company") {
+			t.Publisher = track.AlbumData.Attributes.RecordLabel
+		}
 	}
 
-	if track.Resp.Attributes.ContentRating == "explicit" {
-		t.ItunesAdvisory = mp4tag.ItunesAdvisoryExplicit
-	} else if track.Resp.Attributes.ContentRating == "clean" {
-		t.ItunesAdvisory = mp4tag.ItunesAdvisoryClean
-	} else {
-		t.ItunesAdvisory = mp4tag.ItunesAdvisoryNone
+	if metaEnabled(allow, "rtng") {
+		if track.Resp.Attributes.ContentRating == "explicit" {
+			t.ItunesAdvisory = mp4tag.ItunesAdvisoryExplicit
+		} else if track.Resp.Attributes.ContentRating == "clean" {
+			t.ItunesAdvisory = mp4tag.ItunesAdvisoryClean
+		} else {
+			t.ItunesAdvisory = mp4tag.ItunesAdvisoryNone
+		}
 	}
 
 	mp4, err := mp4tag.Open(track.SavePath)
@@ -1891,6 +2074,9 @@ func main() {
 	pflag.BoolVar(&artist_select, "all-album", false, "Download all artist albums")
 	pflag.BoolVar(&debug_mode, "debug", false, "Enable debug mode to show audio quality information")
 	pflag.BoolVar(&print_json, "json", false, "Output JSON summary at the end")
+	pflag.BoolVar(&skip_mv, "skip-mv", false, "Skip music video downloads")
+	pflag.BoolVar(&skip_error, "skip-error", false, "Do not retry on errors (exit after first pass)")
+	pflag.BoolVar(&lyrics_only, "lyrics-only", false, "Only download lyrics (.lrc) and skip audio/MV downloads")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
 	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")
 	aac_type = pflag.String("aac-type", Config.AacType, "Select AAC type, aac aac-binaural aac-downmix")
@@ -1971,6 +2157,16 @@ func main() {
 					continue
 				}
 				counter.Total++
+				if lyrics_only {
+					fmt.Println("Skipping music video (lyrics-only mode)")
+					counter.Success++
+					continue
+				}
+				if skip_mv {
+					fmt.Println("Skipping music video (skip-mv enabled)")
+					counter.Success++
+					continue
+				}
 				if len(Config.MediaUserToken) <= 50 {
 					fmt.Println(": meida-user-token is not set, skip MV dl")
 					counter.Success++
@@ -2050,7 +2246,7 @@ func main() {
 			}
 		}
 		fmt.Printf("=======  [\u2714 ] Completed: %d/%d  |  [\u26A0 ] Warnings: %d  |  [\u2716 ] Errors: %d  =======\n", counter.Success, counter.Total, counter.Unavailable+counter.NotSong, counter.Error)
-		if counter.Error == 0 {
+		if counter.Error == 0 || skip_error {
 			break
 		}
 		fmt.Println("Error detected, press Enter to try again...")
@@ -2071,6 +2267,15 @@ func main() {
 }
 
 func mvDownloader(adamID string, saveDir string, token string, storefront string, mediaUserToken string, track *task.Track) error {
+	if lyrics_only {
+		fmt.Println("Skipping MV download (lyrics-only mode)")
+		return nil
+	}
+	if skip_mv {
+		fmt.Println("Skipping MV download (skip-mv enabled)")
+		return nil
+	}
+	allow := embedMetaAllowlist()
 	MVInfo, err := ampapi.GetMusicVideoResp(storefront, adamID, Config.Language, token)
 	if err != nil {
 		fmt.Println("\u26A0 Failed to get MV manifest:", err)
@@ -2130,60 +2335,105 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 	_ = runv3.ExtMvData(audiokeyAndUrls, audPath)
 	defer os.Remove(audPath)
 
-	tags := []string{
-		"tool=",
-		fmt.Sprintf("artist=%s", MVInfo.Data[0].Attributes.ArtistName),
-		fmt.Sprintf("title=%s", MVInfo.Data[0].Attributes.Name),
-		fmt.Sprintf("genre=%s", MVInfo.Data[0].Attributes.GenreNames[0]),
-		fmt.Sprintf("created=%s", MVInfo.Data[0].Attributes.ReleaseDate),
-		fmt.Sprintf("ISRC=%s", MVInfo.Data[0].Attributes.Isrc),
+	tags := []string{"tool="}
+	if metaEnabled(allow, "artist") {
+		tags = append(tags, fmt.Sprintf("artist=%s", MVInfo.Data[0].Attributes.ArtistName))
+		tags = append(tags, fmt.Sprintf("performer=%s", MVInfo.Data[0].Attributes.ArtistName))
+	}
+	if metaEnabled(allow, "title") {
+		tags = append(tags, fmt.Sprintf("title=%s", MVInfo.Data[0].Attributes.Name))
+	}
+	if metaEnabled(allow, "genre") && len(MVInfo.Data[0].Attributes.GenreNames) > 0 {
+		tags = append(tags, fmt.Sprintf("genre=%s", MVInfo.Data[0].Attributes.GenreNames[0]))
+	}
+	if metaEnabled(allow, "created") {
+		tags = append(tags, fmt.Sprintf("created=%s", MVInfo.Data[0].Attributes.ReleaseDate))
+	}
+	if metaEnabled(allow, "isrc") {
+		tags = append(tags, fmt.Sprintf("ISRC=%s", MVInfo.Data[0].Attributes.Isrc))
 	}
 
-	if MVInfo.Data[0].Attributes.ContentRating == "explicit" {
-		tags = append(tags, "rating=1")
-	} else if MVInfo.Data[0].Attributes.ContentRating == "clean" {
-		tags = append(tags, "rating=2")
-	} else {
-		tags = append(tags, "rating=0")
+	if metaEnabled(allow, "rtng") {
+		if MVInfo.Data[0].Attributes.ContentRating == "explicit" {
+			tags = append(tags, "rating=1")
+		} else if MVInfo.Data[0].Attributes.ContentRating == "clean" {
+			tags = append(tags, "rating=2")
+		} else {
+			tags = append(tags, "rating=0")
+		}
 	}
 
 	if track != nil {
 		if track.PreType == "playlists" && !Config.UseSongInfoForPlaylist {
-			tags = append(tags, "disk=1/1")
-			tags = append(tags, fmt.Sprintf("album=%s", track.PlaylistData.Attributes.Name))
-			tags = append(tags, fmt.Sprintf("track=%d", track.TaskNum))
-			tags = append(tags, fmt.Sprintf("tracknum=%d/%d", track.TaskNum, track.TaskTotal))
-			tags = append(tags, fmt.Sprintf("album_artist=%s", track.PlaylistData.Attributes.ArtistName))
-			tags = append(tags, fmt.Sprintf("performer=%s", track.Resp.Attributes.ArtistName))
+			if metaEnabled(allow, "disk") {
+				tags = append(tags, "disk=1/1")
+			}
+			if metaEnabled(allow, "album") {
+				tags = append(tags, fmt.Sprintf("album=%s", track.PlaylistData.Attributes.Name))
+			}
+			if metaEnabled(allow, "tracknum") {
+				tags = append(tags, fmt.Sprintf("track=%d", track.TaskNum))
+				tags = append(tags, fmt.Sprintf("tracknum=%d/%d", track.TaskNum, track.TaskTotal))
+			}
+			if metaEnabled(allow, "album_artist") {
+				tags = append(tags, fmt.Sprintf("album_artist=%s", track.PlaylistData.Attributes.ArtistName))
+			}
 		} else if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
-			tags = append(tags, fmt.Sprintf("album=%s", track.AlbumData.Attributes.Name))
-			tags = append(tags, fmt.Sprintf("disk=%d/%d", track.Resp.Attributes.DiscNumber, track.DiscTotal))
-			tags = append(tags, fmt.Sprintf("track=%d", track.Resp.Attributes.TrackNumber))
-			tags = append(tags, fmt.Sprintf("tracknum=%d/%d", track.Resp.Attributes.TrackNumber, track.AlbumData.Attributes.TrackCount))
-			tags = append(tags, fmt.Sprintf("album_artist=%s", track.AlbumData.Attributes.ArtistName))
-			tags = append(tags, fmt.Sprintf("performer=%s", track.Resp.Attributes.ArtistName))
-			tags = append(tags, fmt.Sprintf("copyright=%s", track.AlbumData.Attributes.Copyright))
-			tags = append(tags, fmt.Sprintf("UPC=%s", track.AlbumData.Attributes.Upc))
+			if metaEnabled(allow, "album") {
+				tags = append(tags, fmt.Sprintf("album=%s", track.AlbumData.Attributes.Name))
+			}
+			if metaEnabled(allow, "disk") {
+				tags = append(tags, fmt.Sprintf("disk=%d/%d", track.Resp.Attributes.DiscNumber, track.DiscTotal))
+			}
+			if metaEnabled(allow, "tracknum") {
+				tags = append(tags, fmt.Sprintf("track=%d", track.Resp.Attributes.TrackNumber))
+				tags = append(tags, fmt.Sprintf("tracknum=%d/%d", track.Resp.Attributes.TrackNumber, track.AlbumData.Attributes.TrackCount))
+			}
+			if metaEnabled(allow, "album_artist") {
+				tags = append(tags, fmt.Sprintf("album_artist=%s", track.AlbumData.Attributes.ArtistName))
+			}
+			if metaEnabled(allow, "copyright") {
+				tags = append(tags, fmt.Sprintf("copyright=%s", track.AlbumData.Attributes.Copyright))
+			}
+			if metaEnabled(allow, "upc") {
+				tags = append(tags, fmt.Sprintf("UPC=%s", track.AlbumData.Attributes.Upc))
+			}
 		} else {
-			tags = append(tags, fmt.Sprintf("album=%s", track.AlbumData.Attributes.Name))
-			tags = append(tags, fmt.Sprintf("disk=%d/%d", track.Resp.Attributes.DiscNumber, track.DiscTotal))
-			tags = append(tags, fmt.Sprintf("track=%d", track.Resp.Attributes.TrackNumber))
-			tags = append(tags, fmt.Sprintf("tracknum=%d/%d", track.Resp.Attributes.TrackNumber, track.AlbumData.Attributes.TrackCount))
-			tags = append(tags, fmt.Sprintf("album_artist=%s", track.AlbumData.Attributes.ArtistName))
-			tags = append(tags, fmt.Sprintf("performer=%s", track.Resp.Attributes.ArtistName))
-			tags = append(tags, fmt.Sprintf("copyright=%s", track.AlbumData.Attributes.Copyright))
-			tags = append(tags, fmt.Sprintf("UPC=%s", track.AlbumData.Attributes.Upc))
+			if metaEnabled(allow, "album") {
+				tags = append(tags, fmt.Sprintf("album=%s", track.AlbumData.Attributes.Name))
+			}
+			if metaEnabled(allow, "disk") {
+				tags = append(tags, fmt.Sprintf("disk=%d/%d", track.Resp.Attributes.DiscNumber, track.DiscTotal))
+			}
+			if metaEnabled(allow, "tracknum") {
+				tags = append(tags, fmt.Sprintf("track=%d", track.Resp.Attributes.TrackNumber))
+				tags = append(tags, fmt.Sprintf("tracknum=%d/%d", track.Resp.Attributes.TrackNumber, track.AlbumData.Attributes.TrackCount))
+			}
+			if metaEnabled(allow, "album_artist") {
+				tags = append(tags, fmt.Sprintf("album_artist=%s", track.AlbumData.Attributes.ArtistName))
+			}
+			if metaEnabled(allow, "copyright") {
+				tags = append(tags, fmt.Sprintf("copyright=%s", track.AlbumData.Attributes.Copyright))
+			}
+			if metaEnabled(allow, "upc") {
+				tags = append(tags, fmt.Sprintf("UPC=%s", track.AlbumData.Attributes.Upc))
+			}
 		}
 	} else {
-		tags = append(tags, fmt.Sprintf("album=%s", MVInfo.Data[0].Attributes.AlbumName))
-		tags = append(tags, fmt.Sprintf("disk=%d", MVInfo.Data[0].Attributes.DiscNumber))
-		tags = append(tags, fmt.Sprintf("track=%d", MVInfo.Data[0].Attributes.TrackNumber))
-		tags = append(tags, fmt.Sprintf("tracknum=%d", MVInfo.Data[0].Attributes.TrackNumber))
-		tags = append(tags, fmt.Sprintf("performer=%s", MVInfo.Data[0].Attributes.ArtistName))
+		if metaEnabled(allow, "album") {
+			tags = append(tags, fmt.Sprintf("album=%s", MVInfo.Data[0].Attributes.AlbumName))
+		}
+		if metaEnabled(allow, "disk") {
+			tags = append(tags, fmt.Sprintf("disk=%d", MVInfo.Data[0].Attributes.DiscNumber))
+		}
+		if metaEnabled(allow, "tracknum") {
+			tags = append(tags, fmt.Sprintf("track=%d", MVInfo.Data[0].Attributes.TrackNumber))
+			tags = append(tags, fmt.Sprintf("tracknum=%d", MVInfo.Data[0].Attributes.TrackNumber))
+		}
 	}
 
 	var covPath string
-	if true {
+	if metaEnabled(allow, "cover") {
 		thumbURL := MVInfo.Data[0].Attributes.Artwork.URL
 		baseThumbName := forbiddenNames.ReplaceAllString(mvSaveName, "_") + "_thumbnail"
 		covPath, err = writeCover(saveDir, baseThumbName, thumbURL)
@@ -2193,7 +2443,9 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 			tags = append(tags, fmt.Sprintf("cover=%s", covPath))
 		}
 	}
-	defer os.Remove(covPath)
+	if covPath != "" {
+		defer os.Remove(covPath)
+	}
 
 	tagsString := strings.Join(tags, ":")
 	muxCmd := exec.Command("MP4Box", "-itags", tagsString, "-quiet", "-add", vidPath, "-add", audPath, "-keep-utc", "-new", mvOutPath)

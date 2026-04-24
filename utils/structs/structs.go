@@ -35,6 +35,15 @@ type ConfigSet struct {
 	AlacMax                    int    `yaml:"alac-max"`
 	AtmosMax                   int    `yaml:"atmos-max"`
 	LimitMax                   int    `yaml:"limit-max"`
+	// PathPartMax controls the maximum length (runes) of any single folder/file name part we generate
+	// from templates (artist/album/playlist/song names). If 0, LimitMax is used as a fallback.
+	PathPartMax int `yaml:"path-part-max"`
+	// PathPartTrimVars is an ordered list of template variables (e.g. "{ArtistName}") that may be
+	// blanked out when the rendered name exceeds PathPartMax/LimitMax.
+	PathPartTrimVars []string `yaml:"path-part-trim-vars"`
+	// EmbedMetadata is an allow-list of metadata keys to embed into media files.
+	// If empty, a default set is used.
+	EmbedMetadata []string `yaml:"embed-metadata"`
 	UseSongInfoForPlaylist     bool   `yaml:"use-songinfo-for-playlist"`
 	DlAlbumcoverForPlaylist    bool   `yaml:"dl-albumcover-for-playlist"`
 	MVAudioType                string `yaml:"mv-audio-type"`
