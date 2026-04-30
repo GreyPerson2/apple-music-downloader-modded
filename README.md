@@ -75,6 +75,35 @@ docker run --network host -v ./downloads:/downloads -v ./config.yaml:/app/config
 7. For aac: `go run main.go --aac https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538`.
 8. For see quality: `go run main.go --debug https://music.apple.com/us/album/1989-taylors-version-deluxe/1713845538`.
 
+## Batch URLs from a file
+
+You can add URLs from a file for batch processing (one URL per line; empty lines and lines starting with `#` are ignored):
+
+```bash
+go run main.go --input-file urls.txt
+```
+
+You can also combine `--input-file` with normal positional URLs:
+
+```bash
+go run main.go --input-file urls.txt "https://music.apple.com/us/album/..."
+```
+
+## SQLite logging (amdl.sqlite)
+
+The downloader writes a SQLite database **by default** to `./amdl.sqlite` (same directory as `config.yaml` when you run the program from that directory).
+
+- Override the location with:
+
+```bash
+go run main.go --db-path /path/to/amdl.sqlite ...
+```
+
+- Stored tables:
+  - `runs`: one row per invocation
+  - `url_jobs`: one row per URL processed (status, error text, counter deltas)
+  - `tracks`: one row per track attempt (IDs, names, codec/quality, lyrics info, output path, status)
+
 [Chinese tutorial - see Method 3 for details](https://telegra.ph/Apple-Music-Alac高解析度无损音乐下载教程-04-02-2)
 
 ## Downloading lyrics

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"main/utils/ampapi"
+	"main/utils/db"
 	"main/utils/lyrics"
 	"main/utils/runv2"
 	"main/utils/runv3"
@@ -49,6 +51,8 @@ var (
 	skip_mv        bool
 	skip_error     bool
 	auto_retry     int
+	input_file     string
+	db_path        string
 	lyrics_only    bool
 	alac_max       *int
 	atmos_max      *int
@@ -59,6 +63,8 @@ var (
 	counter        structs.Counter
 	okDict         = make(map[string][]int)
 	AddedTracks    []AddedTrack
+	dbLogger       *db.Logger
+	activeURLJobID int64
 )
 
 type AddedTrack struct {
@@ -578,6 +584,23 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
+func readURLsFromFile(p string) ([]string, error) {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(b), "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || strings.HasPrefix(ln, "#") {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return out, nil
+}
+
 // START: New functions for search functionality
 
 // SearchResultItem is a unified struct to hold search results for display.
@@ -940,6 +963,57 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	counter.Total++
 	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
 
+	logTrack := func(status string, outputPath string, convertedPath string, hasLyrics bool, logErr error) {
+		if dbLogger == nil {
+			return
+		}
+		artistID := ""
+		if len(track.Resp.Relationships.Artists.Data) > 0 {
+			artistID = track.Resp.Relationships.Artists.Data[0].ID
+		}
+		albumID := ""
+		playlistID := ""
+		stationID := ""
+		switch track.PreType {
+		case "albums":
+			albumID = track.PreID
+		case "playlists":
+			playlistID = track.PreID
+		case "stations":
+			stationID = track.PreID
+		}
+
+		errText := ""
+		if logErr != nil {
+			errText = logErr.Error()
+		}
+		_ = dbLogger.AddTrack(context.Background(), db.TrackEvent{
+			URLJobID: activeURLJobID,
+			TrackID:  track.ID,
+
+			ArtistID:   artistID,
+			AlbumID:    albumID,
+			PlaylistID: playlistID,
+			StationID:  stationID,
+
+			ArtistName: track.Resp.Attributes.ArtistName,
+			AlbumName:  track.Resp.Attributes.AlbumName,
+			SongName:   track.Resp.Attributes.Name,
+
+			CodecMode: track.Codec,
+			Quality:   track.Quality,
+
+			HasLyrics:           hasLyrics,
+			LyricsTypeRequested: Config.LrcType,
+
+			OutputPath:    outputPath,
+			ConvertedPath: convertedPath,
+
+			Status:    status,
+			ErrorText: errText,
+		})
+	}
+
 	//提前获取到的播放列表下track所在的专辑信息
 	if track.PreType == "playlists" && Config.UseSongInfoForPlaylist {
 		track.GetAlbumData(token)
@@ -950,30 +1024,36 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		if lyrics_only {
 			fmt.Println("Skipping MV download (lyrics-only mode)")
 			counter.Success++
+			logTrack("skipped_lyrics_only", "", "", false, nil)
 			return
 		}
 		if skip_mv {
 			fmt.Println("Skipping MV download (skip-mv enabled)")
 			counter.Success++
+			logTrack("skipped_mv", "", "", false, nil)
 			return
 		}
 		if len(mediaUserToken) <= 50 {
 			fmt.Println("meida-user-token is not set, skip MV dl")
 			counter.Success++
+			logTrack("skipped_no_media_user_token", "", "", false, nil)
 			return
 		}
 		if _, err := exec.LookPath("mp4decrypt"); err != nil {
 			fmt.Println("mp4decrypt is not found, skip MV dl")
 			counter.Success++
+			logTrack("skipped_mp4decrypt_missing", "", "", false, nil)
 			return
 		}
 		err := mvDownloader(track.ID, track.SaveDir, token, track.Storefront, mediaUserToken, track)
 		if err != nil {
 			fmt.Println("\u26A0 Failed to dl MV:", err)
 			counter.Error++
+			logTrack("error", "", "", false, err)
 			return
 		}
 		counter.Success++
+		logTrack("downloaded", track.SavePath, "", false, nil)
 		return
 	}
 
@@ -1016,6 +1096,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			if err != nil {
 				fmt.Println("Failed to extract quality from manifest.\n", err)
 				counter.Error++
+				logTrack("error", "", "", false, err)
 				return
 			}
 		}
@@ -1091,7 +1172,10 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 		if !lyricsDownloaded {
 			fmt.Println("No lyrics found for this track")
+			logTrack("lyrics_only_no_lyrics", filepath.Join(track.SaveDir, lrcFilename), "", false, nil)
+			return
 		}
+		logTrack("lyrics_only", filepath.Join(track.SaveDir, lrcFilename), "", true, nil)
 		return
 	}
 
@@ -1116,6 +1200,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			Album:    track.Resp.Attributes.AlbumName,
 			Song:     track.Resp.Attributes.Name,
 		})
+		logTrack("existed", trackPath, "", lyricsDownloaded, nil)
 		return
 	}
 	if considerConverted {
@@ -1136,6 +1221,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 				Album:    track.Resp.Attributes.AlbumName,
 				Song:     track.Resp.Attributes.Name,
 			})
+			logTrack("converted_existed", convertedPath, convertedPath, lyricsDownloaded, nil)
 			return
 		}
 	}
@@ -1144,6 +1230,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		if len(mediaUserToken) <= 50 {
 			fmt.Println("Invalid media-user-token")
 			counter.Error++
+			logTrack("error", "", "", lyricsDownloaded, fmt.Errorf("invalid media-user-token"))
 			return
 		}
 		_, err := runv3.Run(track.ID, trackPath, token, mediaUserToken, false, "")
@@ -1151,9 +1238,11 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			fmt.Println("Failed to dl aac-lc:", err)
 			if err.Error() == "Unavailable" {
 				counter.Unavailable++
+				logTrack("unavailable", "", "", lyricsDownloaded, err)
 				return
 			}
 			counter.Error++
+			logTrack("error", "", "", lyricsDownloaded, err)
 			return
 		}
 	} else {
@@ -1161,6 +1250,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		if err != nil {
 			fmt.Println("\u26A0 Failed to extract info from manifest:", err)
 			counter.Unavailable++
+			logTrack("unavailable", "", "", lyricsDownloaded, err)
 			return
 		}
 		//边下载边解密
@@ -1168,6 +1258,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		if err != nil {
 			fmt.Println("Failed to run v2:", err)
 			counter.Error++
+			logTrack("error", "", "", lyricsDownloaded, err)
 			return
 		}
 	}
@@ -1191,12 +1282,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("Embed failed: %v\n", err)
 		counter.Error++
+		logTrack("error", trackPath, "", lyricsDownloaded, err)
 		return
 	}
 	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 		if err := os.Remove(track.CoverPath); err != nil {
 			fmt.Printf("Error deleting file: %s\n", track.CoverPath)
 			counter.Error++
+			logTrack("error", trackPath, "", lyricsDownloaded, err)
 			return
 		}
 	}
@@ -1205,6 +1298,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	if err != nil {
 		fmt.Println("\u26A0 Failed to write tags in media:", err)
 		counter.Unavailable++
+		logTrack("error", trackPath, "", lyricsDownloaded, err)
 		return
 	}
 
@@ -1224,6 +1318,11 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	})
 
 	counter.Success++
+	convertedOut := ""
+	if considerConverted && track.SavePath != trackPath {
+		convertedOut = track.SavePath
+	}
+	logTrack("downloaded", track.SavePath, convertedOut, lyricsDownloaded, nil)
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 }
 
@@ -2093,6 +2192,9 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 }
 
 func main() {
+	ctx := context.Background()
+	origArgs := append([]string{}, os.Args...)
+
 	err := loadConfig()
 	if err != nil {
 		fmt.Printf("load Config failed: %v", err)
@@ -2119,6 +2221,8 @@ func main() {
 	pflag.BoolVar(&skip_mv, "skip-mv", false, "Skip music video downloads")
 	pflag.BoolVar(&skip_error, "skip-error", false, "Do not retry on errors (exit after first pass)")
 	pflag.IntVar(&auto_retry, "auto-retry", 3, "Automatically retry up to N times when errors occur (0 = prompt and wait for Enter)")
+	pflag.StringVar(&input_file, "input-file", "", "Read additional URLs from a file (one URL per line; lines starting with # are ignored)")
+	pflag.StringVar(&db_path, "db-path", db.DefaultFilename, "SQLite database path for logging (default: amdl.sqlite)")
 	pflag.BoolVar(&lyrics_only, "lyrics-only", false, "Only download lyrics (.lrc) and skip audio/MV downloads")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
 	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")
@@ -2144,6 +2248,25 @@ func main() {
 	Config.MVMax = *mv_max
 
 	args := pflag.Args()
+	if input_file != "" {
+		fileURLs, err := readURLsFromFile(input_file)
+		if err != nil {
+			fmt.Printf("Failed to read --input-file: %v\n", err)
+			return
+		}
+		args = append(args, fileURLs...)
+	}
+
+	dbLogger, err = db.Open(ctx, db.OpenOptions{
+		Path:       db_path,
+		Args:       origArgs,
+		Storefront: Config.Storefront,
+	})
+	if err != nil {
+		fmt.Printf("Failed to open sqlite db: %v\n", err)
+		return
+	}
+	defer dbLogger.Close()
 
 	if search_type != "" {
 		if len(args) == 0 {
@@ -2198,30 +2321,89 @@ func main() {
 			fmt.Printf("Queue %d of %d: ", albumNum+1, albumTotal)
 			var storefront, albumId string
 
+			beforeErr := counter.Error
+			beforeSucc := counter.Success
+
+			urlType := "unknown"
+			entityID := ""
+			if strings.Contains(urlRaw, "/music-video/") {
+				urlType = "mv"
+				storefront, entityID = checkUrlMv(urlRaw)
+			} else if strings.Contains(urlRaw, "/song/") {
+				urlType = "song"
+				storefront, entityID = checkUrlSong(urlRaw)
+			} else if strings.Contains(urlRaw, "/album/") {
+				urlType = "album"
+				storefront, entityID = checkUrl(urlRaw)
+			} else if strings.Contains(urlRaw, "/playlist/") {
+				urlType = "playlist"
+				storefront, entityID = checkUrlPlaylist(urlRaw)
+			} else if strings.Contains(urlRaw, "/station/") {
+				urlType = "station"
+				storefront, entityID = checkUrlStation(urlRaw)
+			}
+
+			jobID, _ := dbLogger.StartURLJob(ctx, db.URLJobStart{
+				QueueIndex: albumNum + 1,
+				URLRaw:     urlRaw,
+				URLType:    urlType,
+				Storefront: storefront,
+				EntityID:   entityID,
+			})
+			activeURLJobID = jobID
+
+			finishJob := func(callErr error) {
+				afterErr := counter.Error
+				afterSucc := counter.Success
+				errDelta := afterErr - beforeErr
+				succDelta := afterSucc - beforeSucc
+
+				status := "success"
+				var errText string
+				if callErr != nil {
+					errText = callErr.Error()
+				}
+				if callErr != nil || errDelta > 0 {
+					status = "error"
+				}
+				_ = dbLogger.FinishURLJob(ctx, jobID, db.URLJobFinish{
+					Status:            status,
+					ErrorText:         errText,
+					CounterErrorDelta: errDelta,
+					CounterSuccDelta:  succDelta,
+				})
+				activeURLJobID = 0
+			}
+
 			if strings.Contains(urlRaw, "/music-video/") {
 				fmt.Println("Music Video")
 				if debug_mode {
+					finishJob(nil)
 					continue
 				}
 				counter.Total++
 				if lyrics_only {
 					fmt.Println("Skipping music video (lyrics-only mode)")
 					counter.Success++
+					finishJob(nil)
 					continue
 				}
 				if skip_mv {
 					fmt.Println("Skipping music video (skip-mv enabled)")
 					counter.Success++
+					finishJob(nil)
 					continue
 				}
 				if len(Config.MediaUserToken) <= 50 {
 					fmt.Println(": meida-user-token is not set, skip MV dl")
 					counter.Success++
+					finishJob(nil)
 					continue
 				}
 				if _, err := exec.LookPath("mp4decrypt"); err != nil {
 					fmt.Println(": mp4decrypt is not found, skip MV dl")
 					counter.Success++
+					finishJob(nil)
 					continue
 				}
 				mvSaveDir := strings.NewReplacer(
@@ -2239,9 +2421,11 @@ func main() {
 				if err != nil {
 					fmt.Println("\u26A0 Failed to dl MV:", err)
 					counter.Error++
+					finishJob(err)
 					continue
 				}
 				counter.Success++
+				finishJob(nil)
 				continue
 			}
 			if strings.Contains(urlRaw, "/song/") {
@@ -2249,16 +2433,21 @@ func main() {
 				storefront, songId := checkUrlSong(urlRaw)
 				if storefront == "" || songId == "" {
 					fmt.Println("Invalid song URL format.")
+					finishJob(fmt.Errorf("invalid song URL format"))
 					continue
 				}
 				err := ripSong(songId, token, storefront, Config.MediaUserToken)
 				if err != nil {
 					fmt.Println("Failed to rip song:", err)
+					finishJob(err)
+					continue
 				}
+				finishJob(nil)
 				continue
 			}
 			parse, err := url.Parse(urlRaw)
 			if err != nil {
+				finishJob(err)
 				log.Fatalf("Invalid URL: %v", err)
 			}
 			var urlArg_i = parse.Query().Get("i")
@@ -2269,27 +2458,38 @@ func main() {
 				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i)
 				if err != nil {
 					fmt.Println("Failed to rip album:", err)
+					finishJob(err)
+					continue
 				}
+				finishJob(nil)
 			} else if strings.Contains(urlRaw, "/playlist/") {
 				fmt.Println("Playlist")
 				storefront, albumId = checkUrlPlaylist(urlRaw)
 				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken)
 				if err != nil {
 					fmt.Println("Failed to rip playlist:", err)
+					finishJob(err)
+					continue
 				}
+				finishJob(nil)
 			} else if strings.Contains(urlRaw, "/station/") {
 				fmt.Printf("Station")
 				storefront, albumId = checkUrlStation(urlRaw)
 				if len(Config.MediaUserToken) <= 50 {
 					fmt.Println(": meida-user-token is not set, skip station dl")
+					finishJob(nil)
 					continue
 				}
 				err := ripStation(albumId, token, storefront, Config.MediaUserToken)
 				if err != nil {
 					fmt.Println("Failed to rip station:", err)
+					finishJob(err)
+					continue
 				}
+				finishJob(nil)
 			} else {
 				fmt.Println("Invalid type")
+				finishJob(fmt.Errorf("invalid type"))
 			}
 		}
 		fmt.Printf("=======  [\u2714 ] Completed: %d/%d  |  [\u26A0 ] Warnings: %d  |  [\u2716 ] Errors: %d  =======\n", counter.Success, counter.Total, counter.Unavailable+counter.NotSong, counter.Error)
