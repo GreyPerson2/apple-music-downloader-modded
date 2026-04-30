@@ -4,6 +4,13 @@ type ConfigSet struct {
 	Storefront                 string `yaml:"storefront"`
 	MediaUserToken             string `yaml:"media-user-token"`
 	AuthorizationToken         string `yaml:"authorization-token"`
+	// Optional: load credentials artifacts from a local wrapper-manager deployment.
+	// If set, and `media-user-token` is empty/invalid, the downloader will read:
+	//   <wrapper-manager-data-dir>/wrapper/rootfs/data/instances/<id>/MUSIC_TOKEN
+	// and optionally:
+	//   <wrapper-manager-data-dir>/wrapper/rootfs/data/instances/<id>/STOREFRONT_ID
+	WrapperManagerDataDir      string `yaml:"wrapper-manager-data-dir"`
+	WrapperManagerInstanceID   string `yaml:"wrapper-manager-instance-id"`
 	Language                   string `yaml:"language"`
 	SaveLrcFile                bool   `yaml:"save-lrc-file"`
 	LrcType                    string `yaml:"lrc-type"`

@@ -48,6 +48,7 @@ var (
 	print_json     bool
 	skip_mv        bool
 	skip_error     bool
+	auto_retry     int
 	lyrics_only    bool
 	alac_max       *int
 	atmos_max      *int
@@ -68,6 +69,46 @@ type AddedTrack struct {
 	Song     string `json:"song"`
 }
 
+func readWrapperManagerInstanceFile(dataDir, instanceID, name string) (string, error) {
+	if dataDir == "" || instanceID == "" {
+		return "", fmt.Errorf("wrapper-manager data dir or instance id not set")
+	}
+	p := filepath.Join(
+		dataDir,
+		"wrapper", "rootfs", "data", "instances",
+		instanceID,
+		name,
+	)
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+func maybeHydrateFromWrapperManager() {
+	// If the user already provided a plausible token, keep it.
+	if len(Config.MediaUserToken) > 50 && Config.MediaUserToken != "your-media-user-token" {
+		return
+	}
+	if Config.WrapperManagerDataDir == "" || Config.WrapperManagerInstanceID == "" {
+		return
+	}
+
+	mut, err := readWrapperManagerInstanceFile(Config.WrapperManagerDataDir, Config.WrapperManagerInstanceID, "MUSIC_TOKEN")
+	if err == nil && len(mut) > 50 {
+		Config.MediaUserToken = mut
+	}
+
+	// Storefront is optional, but helps lyrics/search correctness.
+	if len(Config.Storefront) != 2 {
+		sf, err := readWrapperManagerInstanceFile(Config.WrapperManagerDataDir, Config.WrapperManagerInstanceID, "STOREFRONT_ID")
+		if err == nil && len(sf) == 2 {
+			Config.Storefront = strings.ToLower(sf)
+		}
+	}
+}
+
 func loadConfig() error {
 	data, err := os.ReadFile("config.yaml")
 	if err != nil {
@@ -77,6 +118,7 @@ func loadConfig() error {
 	if err != nil {
 		return err
 	}
+	maybeHydrateFromWrapperManager()
 	if len(Config.Storefront) != 2 {
 		Config.Storefront = "us"
 	}
@@ -1528,17 +1570,17 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 	Tag_string := strings.Join(stringsToJoin, " ")
 	var albumFolderName string
 	albumFolderName = renderTemplateWithTrim(Config.AlbumFolderFormat, map[string]string{
-		"{ReleaseDate}":  meta.Data[0].Attributes.ReleaseDate,
-		"{ReleaseYear}":  meta.Data[0].Attributes.ReleaseDate[:4],
-		"{ArtistName}":   LimitString(meta.Data[0].Attributes.ArtistName),
-		"{AlbumName}":    LimitString(meta.Data[0].Attributes.Name),
-		"{UPC}":          meta.Data[0].Attributes.Upc,
-		"{RecordLabel}":  meta.Data[0].Attributes.RecordLabel,
-		"{Copyright}":    meta.Data[0].Attributes.Copyright,
-		"{AlbumId}":      albumId,
-		"{Quality}":      Quality,
-		"{Codec}":        Codec,
-		"{Tag}":          Tag_string,
+		"{ReleaseDate}": meta.Data[0].Attributes.ReleaseDate,
+		"{ReleaseYear}": meta.Data[0].Attributes.ReleaseDate[:4],
+		"{ArtistName}":  LimitString(meta.Data[0].Attributes.ArtistName),
+		"{AlbumName}":   LimitString(meta.Data[0].Attributes.Name),
+		"{UPC}":         meta.Data[0].Attributes.Upc,
+		"{RecordLabel}": meta.Data[0].Attributes.RecordLabel,
+		"{Copyright}":   meta.Data[0].Attributes.Copyright,
+		"{AlbumId}":     albumId,
+		"{Quality}":     Quality,
+		"{Codec}":       Codec,
+		"{Tag}":         Tag_string,
 	})
 
 	if strings.HasSuffix(albumFolderName, ".") {
@@ -1901,8 +1943,8 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 	allow := embedMetaAllowlist()
 	t := &mp4tag.MP4Tags{
 		Custom: map[string]string{
-			"LABEL":       "",
-			"UPC":         "",
+			"LABEL": "",
+			"UPC":   "",
 		},
 	}
 
@@ -2076,6 +2118,7 @@ func main() {
 	pflag.BoolVar(&print_json, "json", false, "Output JSON summary at the end")
 	pflag.BoolVar(&skip_mv, "skip-mv", false, "Skip music video downloads")
 	pflag.BoolVar(&skip_error, "skip-error", false, "Do not retry on errors (exit after first pass)")
+	pflag.IntVar(&auto_retry, "auto-retry", 3, "Automatically retry up to N times when errors occur (0 = prompt and wait for Enter)")
 	pflag.BoolVar(&lyrics_only, "lyrics-only", false, "Only download lyrics (.lrc) and skip audio/MV downloads")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
 	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")
@@ -2091,6 +2134,9 @@ func main() {
 	}
 
 	pflag.Parse()
+	if auto_retry < 0 {
+		auto_retry = 0
+	}
 	Config.AlacMax = *alac_max
 	Config.AtmosMax = *atmos_max
 	Config.AacType = *aac_type
@@ -2146,6 +2192,7 @@ func main() {
 		os.Args = append(albumArgs, mvArgs...)
 	}
 	albumTotal := len(os.Args)
+	retriesLeft := auto_retry
 	for {
 		for albumNum, urlRaw := range os.Args {
 			fmt.Printf("Queue %d of %d: ", albumNum+1, albumTotal)
@@ -2249,10 +2296,23 @@ func main() {
 		if counter.Error == 0 || skip_error {
 			break
 		}
-		fmt.Println("Error detected, press Enter to try again...")
-		fmt.Scanln()
-		fmt.Println("Start trying again...")
-		counter = structs.Counter{}
+		if retriesLeft > 0 {
+			retriesLeft--
+			fmt.Printf("Error detected, auto-retrying... (%d retries left)\n", retriesLeft)
+			time.Sleep(2 * time.Second)
+			fmt.Println("Start trying again...")
+			counter = structs.Counter{}
+			continue
+		}
+		if auto_retry == 0 {
+			fmt.Println("Error detected, press Enter to try again...")
+			fmt.Scanln()
+			fmt.Println("Start trying again...")
+			counter = structs.Counter{}
+			continue
+		}
+		fmt.Println("Error detected and auto-retry limit reached.")
+		os.Exit(1)
 	}
 
 	// Print JSON output
