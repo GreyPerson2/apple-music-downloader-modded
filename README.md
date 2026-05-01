@@ -89,6 +89,28 @@ You can also combine `--input-file` with normal positional URLs:
 go run main.go --input-file urls.txt "https://music.apple.com/us/album/..."
 ```
 
+## Verbose logging
+
+Enable extra terminal logs for URL classification and artist expansion failures:
+
+```bash
+go run main.go --verbose --input-file urls.txt
+```
+
+This is useful when you see messages like **"Failed to get artist albums."** or unexpected URL handling.
+
+## Check which lines are invalid (helper script)
+
+To find which entries in a list file are not supported URL types, use:
+
+```bash
+python3 tools/check_list_urls.py urls.txt
+```
+
+Notes:
+- Lines starting with `#` and empty lines are ignored (same as `--input-file`).
+- Artist URLs (`/artist/...`) are treated as inputs that expand into album/MV URLs; they are not direct download types.
+
 ## SQLite logging (amdl.sqlite)
 
 The downloader writes a SQLite database **by default** to `./amdl.sqlite` (same directory as `config.yaml` when you run the program from that directory).
@@ -103,6 +125,29 @@ go run main.go --db-path /path/to/amdl.sqlite ...
   - `runs`: one row per invocation
   - `url_jobs`: one row per URL processed (status, error text, counter deltas)
   - `tracks`: one row per track attempt (IDs, names, codec/quality, lyrics info, output path, status)
+  - `artist_summaries`: one row per artist URL expansion (albums/mvs totals)
+
+## Skipping already processed items
+
+If you run the downloader multiple times, you can skip URLs and/or tracks that were already processed successfully in previous runs recorded in `amdl.sqlite`:
+
+```bash
+go run main.go --skip-processed --skip-processed-scope both ...
+```
+
+- `--skip-processed`: enables skip checks (across runs)
+- `--skip-processed-scope`:
+  - `url`: skip whole URLs if they were already recorded as `url_jobs.status=success`
+  - `track`: skip individual tracks if they were already recorded as processed (`downloaded|existed|converted_existed`)
+  - `both`: do both (recommended)
+
+## Artist URLs in `--input-file`
+
+Artist URLs are expanded into album/music-video URLs before downloading. If expansion fails (for example: artist has no albums in that storefront, or the API returns an error), the tool will print **"Failed to get artist albums."** and treat it like an **Unavailable/warning** (no auto-retry needed).
+
+## Lyrics file format logging
+
+The database now stores **lyrics output file format** per track (`lrc` or `ttml`) in `tracks.lyrics_file_format` (backward compatible with existing DB files).
 
 [Chinese tutorial - see Method 3 for details](https://telegra.ph/Apple-Music-Alac高解析度无损音乐下载教程-04-02-2)
 
