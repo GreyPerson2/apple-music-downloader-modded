@@ -467,6 +467,26 @@ func checkArtist(artistUrl string, token string, relationship string) ([]string,
 		return dateI.Before(dateJ) // 返回 true 表示 i 在 j 前面
 	})
 
+	if Config.TimeRangeDownload && Config.TimeRange != "" {
+		cutoff, err := time.Parse("02-01-2006", Config.TimeRange)
+		if err == nil {
+			before := len(options)
+			filtered := options[:0]
+			for _, opt := range options {
+				albumDate, err := time.Parse("2006-01-02", opt[1])
+				if err != nil || albumDate.Before(cutoff) {
+					continue
+				}
+				filtered = append(filtered, opt)
+			}
+			options = filtered
+			skipped := before - len(options)
+			if skipped > 0 {
+				fmt.Printf("Time-range filter: skipped %d album(s) released before %s\n", skipped, Config.TimeRange)
+			}
+		}
+	}
+
 	table := tablewriter.NewWriter(os.Stdout)
 	if relationship == "albums" {
 		table.SetHeader([]string{"", "Album Name", "Date", "Album ID"})
@@ -2445,7 +2465,7 @@ func main() {
 	pflag.StringVar(&input_file, "input-file", "", "Read additional URLs from a file (one URL per line; lines starting with # are ignored)")
 	pflag.StringVar(&db_path, "db-path", db.DefaultFilename, "SQLite database path for logging (default: amdl.sqlite)")
 	pflag.BoolVar(&skip_processed, "skip-processed", false, "Skip items already processed successfully in the sqlite database (across runs)")
-	pflag.StringVar(&skip_scope, "skip-processed-scope", "both", "Skip scope: url|track|both (only meaningful with --skip-processed)")
+	pflag.StringVar(&skip_scope, "skip-processed-scope", "both", "Skip scope: url|track|album|both (only meaningful with --skip-processed)")
 	pflag.BoolVar(&lyrics_only, "lyrics-only", false, "Only download lyrics (.lrc) and skip audio/MV downloads")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
 	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")

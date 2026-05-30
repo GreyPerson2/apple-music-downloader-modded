@@ -108,3 +108,8 @@ convert-skip-lossy-to-lossless: true
 convert-check-bad-alac: false
 convert-delete-bad-alac: false
 
+# Time-range filtering: only download albums released on or after the given date.
+# When time-range-download is true, albums released before time-range are excluded.
+time-range-download: false
+time-range: "DD-MM-YYYY" # e.g. "25-05-2026"
+

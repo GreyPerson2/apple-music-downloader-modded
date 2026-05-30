@@ -65,7 +65,13 @@ type ConfigSet struct {
 	ConvertWarnLossyToLossless bool   `yaml:"convert-warn-lossy-to-lossless"`
 	ConvertSkipLossyToLossless bool   `yaml:"convert-skip-lossy-to-lossless"`
 	ConvertCheckBadALAC        bool   `yaml:"convert-check-bad-alac"`
-	ConvertDeleteBadALAC       bool   `yaml:"convert-delete-bad-alac"`
+	ConvertDeleteBadALAC        bool   `yaml:"convert-delete-bad-alac"`
+	// TimeRangeDownload enables filtering of artist albums by release date.
+	// When true, only albums released on or after TimeRange are included in the download queue.
+	TimeRangeDownload           bool   `yaml:"time-range-download"`
+	// TimeRange is the cutoff date (DD-MM-YYYY) used when TimeRangeDownload is true.
+	// Albums released before this date are excluded from the download queue.
+	TimeRange                  string `yaml:"time-range"`
 }
 
 type Counter struct {
