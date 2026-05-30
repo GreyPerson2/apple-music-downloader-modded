@@ -1573,9 +1573,12 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 	station.SaveName = playlistFolder
 	fmt.Println(playlistFolder)
 
-	covPath, err := writeCover(playlistFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
-	if err != nil {
-		fmt.Println("Failed to write cover.")
+	var covPath string
+	if !lyrics_only {
+		covPath, err = writeCover(playlistFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
+		if err != nil {
+			fmt.Println("Failed to write cover.")
+		}
 	}
 	station.CoverPath = covPath
 
@@ -1887,9 +1890,12 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 			}
 		}
 	}
-	covPath, err := writeCover(albumFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
-	if err != nil {
-		fmt.Println("Failed to write cover.")
+	var covPath string
+	if !lyrics_only {
+		covPath, err = writeCover(albumFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
+		if err != nil {
+			fmt.Println("Failed to write cover.")
+		}
 	}
 	if Config.SaveAnimatedArtwork && meta.Data[0].Attributes.EditorialVideo.MotionDetailSquare.Video != "" {
 		fmt.Println("Found Animation Artwork.")
@@ -2138,9 +2144,12 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 	os.MkdirAll(playlistFolderPath, os.ModePerm)
 	playlist.SaveName = playlistFolder
 	fmt.Println(playlistFolder)
-	covPath, err := writeCover(playlistFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
-	if err != nil {
-		fmt.Println("Failed to write cover.")
+	var covPath string
+	if !lyrics_only {
+		covPath, err = writeCover(playlistFolderPath, "cover", meta.Data[0].Attributes.Artwork.URL)
+		if err != nil {
+			fmt.Println("Failed to write cover.")
+		}
 	}
 
 	for i := range playlist.Tracks {
@@ -2380,6 +2389,26 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 	return nil
 }
 
+// wasAlbumFullyProcessed fetches an album's tracks from the API and checks
+// whether every track was already processed successfully. Returns (true, nil) to
+// skip the album, (false, nil) to proceed, or (false, err) on failure.
+func wasAlbumFullyProcessed(ctx context.Context, albumId string, storefront string, token string, dbLogger *db.Logger) (bool, error) {
+	album := task.NewAlbum(storefront, albumId)
+	if err := album.GetResp(token, Config.Language); err != nil {
+		return false, fmt.Errorf("failed to fetch album for skip check: %w", err)
+	}
+	for _, track := range album.Resp.Data[0].Relationships.Tracks.Data {
+		ok, err := dbLogger.WasTrackProcessed(ctx, track.ID)
+		if err != nil {
+			return false, fmt.Errorf("track skip check failed: %w", err)
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func main() {
 	ctx := context.Background()
 	origArgs := append([]string{}, os.Args...)
@@ -2439,8 +2468,8 @@ func main() {
 	if skip_scope == "" {
 		skip_scope = "both"
 	}
-	if skip_scope != "url" && skip_scope != "track" && skip_scope != "both" {
-		fmt.Println("Invalid --skip-processed-scope. Must be one of: url, track, both")
+	if skip_scope != "url" && skip_scope != "track" && skip_scope != "album" && skip_scope != "both" {
+		fmt.Println("Invalid --skip-processed-scope. Must be one of: url, track, album, both")
 		return
 	}
 	Config.AlacMax = *alac_max
@@ -2650,6 +2679,19 @@ func main() {
 			}
 
 			// Run the url job, then decide retry/stop.
+			if skip_processed && (skip_scope == "album" || skip_scope == "both") {
+				if strings.Contains(urlRaw, "/album/") {
+					albumStorefront, albumId := checkUrl(urlRaw)
+					ok, err := wasAlbumFullyProcessed(ctx, albumId, albumStorefront, token, dbLogger)
+					if err != nil {
+						uiWarnf("Album skip check failed: %v", err)
+					} else if ok {
+						fmt.Println("Skipping album (all tracks already processed):", urlRaw)
+						finishJob(nil)
+						goto decide
+					}
+				}
+			}
 			if skip_processed && (skip_scope == "url" || skip_scope == "both") {
 				ok, err := dbLogger.WasURLSuccessful(ctx, urlRaw)
 				if err != nil {
