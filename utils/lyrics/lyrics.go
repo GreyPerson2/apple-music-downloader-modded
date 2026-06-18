@@ -129,7 +129,11 @@ func TtmlToLrc(ttml string) (string, error) {
 	}
 
 	var lrcLines []string
-	timingAttr := parsedTTML.FindElement("tt").SelectAttr("itunes:timing")
+	ttElement := parsedTTML.FindElement("tt")
+	if ttElement == nil {
+		return "", errors.New("invalid ttml: missing tt root element")
+	}
+	timingAttr := ttElement.SelectAttr("itunes:timing")
 	if timingAttr != nil {
 		if timingAttr.Value == "Word" {
 			lrc, err := conventSyllableTTMLToLRC(ttml)
@@ -147,7 +151,11 @@ func TtmlToLrc(ttml string) (string, error) {
 		}
 	}
 
-	for _, item := range parsedTTML.FindElement("tt").FindElement("body").ChildElements() {
+	body := ttElement.FindElement("body")
+	if body == nil {
+		return strings.Join(lrcLines, "\n"), nil
+	}
+	for _, item := range body.ChildElements() {
 		for _, lyric := range item.ChildElements() {
 			var h, m, s, ms int
 			beginAttr := lyric.SelectAttr("begin")
@@ -174,16 +182,18 @@ func TtmlToLrc(ttml string) (string, error) {
 			m += h * 60
 			ms = ms / 10
 			var text, transText, translitText string
-			//GET trans and translit
-			if len(parsedTTML.FindElement("tt").FindElements("head")) > 0 {
-				if len(parsedTTML.FindElement("tt").FindElement("head").FindElements("metadata")) > 0 {
-					Metadata := parsedTTML.FindElement("tt").FindElement("head").FindElement("metadata")
-					if len(Metadata.FindElements("iTunesMetadata")) > 0 {
-						iTunesMetadata := Metadata.FindElement("iTunesMetadata")
-						if len(iTunesMetadata.FindElements("transliterations")) > 0 {
-							if len(iTunesMetadata.FindElement("transliterations").FindElements("transliteration")) > 0 {
+			head := ttElement.FindElement("head")
+			if head != nil {
+				Metadata := head.FindElement("metadata")
+				if Metadata != nil {
+					iTunesMetadata := Metadata.FindElement("iTunesMetadata")
+					if iTunesMetadata != nil {
+						transliterations := iTunesMetadata.FindElement("transliterations")
+						if transliterations != nil {
+							transliteration := transliterations.FindElement("transliteration")
+							if transliteration != nil {
 								xpath := fmt.Sprintf("text[@for='%s']", lyric.SelectAttr("itunes:key").Value)
-								translit := iTunesMetadata.FindElement("transliterations").FindElement("transliteration").FindElement(xpath)
+								translit := transliteration.FindElement(xpath)
 								if translit != nil {
 									if translit.SelectAttr("text") != nil {
 										translitText = translit.SelectAttr("text").Value
@@ -201,10 +211,12 @@ func TtmlToLrc(ttml string) (string, error) {
 								}
 							}
 						}
-						if len(iTunesMetadata.FindElements("translations")) > 0 {
-							if len(iTunesMetadata.FindElement("translations").FindElements("translation")) > 0 {
+						translations := iTunesMetadata.FindElement("translations")
+						if translations != nil {
+							translation := translations.FindElement("translation")
+							if translation != nil {
 								xpath := fmt.Sprintf("//text[@for='%s']", lyric.SelectAttr("itunes:key").Value)
-								trans := iTunesMetadata.FindElement("translations").FindElement("translation").FindElement(xpath)
+								trans := translation.FindElement(xpath)
 								if trans != nil {
 									if trans.SelectAttr("text") != nil {
 										transText = trans.SelectAttr("text").Value
@@ -258,6 +270,15 @@ func conventSyllableTTMLToLRC(ttml string) (string, error) {
 		return "", err
 	}
 	var lrcLines []string
+	ttElement := parsedTTML.FindElement("tt")
+	if ttElement == nil {
+		return strings.Join(lrcLines, "\n"), nil
+	}
+	body := ttElement.FindElement("body")
+	if body == nil {
+		return strings.Join(lrcLines, "\n"), nil
+	}
+	divs := body.FindElements("div")
 	parseTime := func(timeValue string, newLine int) (string, error) {
 		var h, m, s, ms int
 		if strings.Contains(timeValue, ":") {
@@ -283,7 +304,6 @@ func conventSyllableTTMLToLRC(ttml string) (string, error) {
 			return fmt.Sprintf("<%02d:%02d.%02d>", m, s, ms), nil
 		}
 	}
-	divs := parsedTTML.FindElement("tt").FindElement("body").FindElements("div")
 	for _, div := range divs {
 		for _, item := range div.ChildElements() {     //LINES
 			var lrcSyllables []string
@@ -303,7 +323,7 @@ func conventSyllableTTMLToLRC(ttml string) (string, error) {
 				}
 				beginTime, err := parseTime(lyric.SelectAttr("begin").Value, i)
 				if err != nil {
-						return "", err
+					return "", err
 				}
 
 				endTime, err = parseTime(lyric.SelectAttr("end").Value, 1)
@@ -328,64 +348,67 @@ func conventSyllableTTMLToLRC(ttml string) (string, error) {
 				if i == 0 {
 					transBeginTime, _ := parseTime(lyric.SelectAttr("begin").Value, -1)
 					sharedTimestamp := ""
-					if len(parsedTTML.FindElement("tt").FindElements("head")) > 0 {
-						if len(parsedTTML.FindElement("tt").FindElement("head").FindElements("metadata")) > 0 {
-							Metadata := parsedTTML.FindElement("tt").FindElement("head").FindElement("metadata")
-							if len(Metadata.FindElements("iTunesMetadata")) > 0 {
-								iTunesMetadata := Metadata.FindElement("iTunesMetadata")
-								if len(iTunesMetadata.FindElements("transliterations")) > 0 {
-									if len(iTunesMetadata.FindElement("transliterations").FindElements("transliteration")) > 0 {
+					head := ttElement.FindElement("head")
+					if head != nil {
+						Metadata := head.FindElement("metadata")
+						if Metadata != nil {
+							iTunesMetadata := Metadata.FindElement("iTunesMetadata")
+							if iTunesMetadata != nil {
+								transliterations := iTunesMetadata.FindElement("transliterations")
+								if transliterations != nil {
+									transliteration := transliterations.FindElement("transliteration")
+									if transliteration != nil {
 										xpath := fmt.Sprintf("text[@for='%s']", item.SelectAttr("itunes:key").Value)
-										trans := iTunesMetadata.FindElement("transliterations").FindElement("transliteration").FindElement(xpath)
-										// Get text content
+										trans := transliteration.FindElement(xpath)
 										var transTxtParts []string
 										var transStartTime string
-										for i, span := range trans.ChildElements() {
-											if span.Tag == "span" {
-												spanBegin := span.SelectAttrValue("begin", "")
-												spanText := span.Text()
-												if spanBegin == "" {
-													continue
+										if trans != nil {
+											for _, span := range trans.ChildElements() {
+												if span.Tag == "span" {
+													spanBegin := span.SelectAttrValue("begin", "")
+													spanText := span.Text()
+													if spanBegin == "" {
+														continue
+													}
+													timestamp, err := parseTime(spanBegin, 2)
+													if err != nil {
+														return "", err
+													}
+													if transStartTime == "" {
+														transStartTime, _ = parseTime(spanBegin, -1)
+														sharedTimestamp = transStartTime
+													}
+													transTxtParts = append(transTxtParts, fmt.Sprintf("%s%s", timestamp, spanText))
 												}
-												// Get timestamp
-												timestamp, err := parseTime(spanBegin, 2)
-												if err != nil {
-													return "", err
-												}
-												if i == 0 {
-													// For [mm:ss.xx] prefix
-													transStartTime, _ = parseTime(spanBegin, -1)
-													sharedTimestamp = transStartTime
-												}
-												transTxtParts = append(transTxtParts, fmt.Sprintf("%s%s", timestamp, spanText))
 											}
+											translitLine = fmt.Sprintf("%s%s", transStartTime, strings.Join(transTxtParts, " "))
 										}
-										translitLine = fmt.Sprintf("%s%s", transStartTime, strings.Join(transTxtParts, " "))
 									}
 								}
-								if len(iTunesMetadata.FindElements("translations")) > 0 {
-									if len(iTunesMetadata.FindElement("translations").FindElements("translation")) > 0 {
+								translations := iTunesMetadata.FindElement("translations")
+								if translations != nil {
+									translation := translations.FindElement("translation")
+									if translation != nil {
 										xpath := fmt.Sprintf("//text[@for='%s']", item.SelectAttr("itunes:key").Value)
-										trans := iTunesMetadata.FindElement("translations").FindElement("translation").FindElement(xpath)
+										trans := translation.FindElement(xpath)
 										var transTxt string
-										if trans.SelectAttr("text") == nil {
-											var textTmp []string
-											for _, span := range trans.Child {
-												if _, ok := span.(*etree.CharData); ok {
-													textTmp = append(textTmp, span.(*etree.CharData).Data)
-												} /*else {
-													textTmp = append(textTmp, span.(*etree.Element).Text())
-												}*/
+										if trans != nil {
+											if trans.SelectAttr("text") == nil {
+												var textTmp []string
+												for _, span := range trans.Child {
+													if _, ok := span.(*etree.CharData); ok {
+														textTmp = append(textTmp, span.(*etree.CharData).Data)
+													}
+												}
+												transTxt = strings.Join(textTmp, "")
+											} else {
+												transTxt = trans.SelectAttr("text").Value
 											}
-											transTxt = strings.Join(textTmp, "")
-										} else {
-											transTxt = trans.SelectAttr("text").Value
-										}
-										//fmt.Println(transTxt)
-										if sharedTimestamp != "" {
-											transLine = sharedTimestamp + transTxt
-										} else {
-											transLine = transBeginTime + transTxt
+											if sharedTimestamp != "" {
+												transLine = sharedTimestamp + transTxt
+											} else {
+												transLine = transBeginTime + transTxt
+											}
 										}
 									}
 								}
@@ -395,10 +418,6 @@ func conventSyllableTTMLToLRC(ttml string) (string, error) {
 				}
 				i += 1
 			}
-			//endTime, err := parseTime(item.SelectAttr("end").Value)
-			//if err != nil {
-			//	return "", err
-			//}
 			if len(transLine) > 0 {
 				lrcLines = append(lrcLines, transLine)
 			}
